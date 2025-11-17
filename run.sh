@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "SESSION_ID=${SESSION_ID:-}" | tee /results/logs/env_${SESSION_ID:-unknown}.log || true
-
-python /code/process_session.py "$SESSION_ID" | tee \
-  "/results/logs/session_${SESSION_ID:-unknown}.log"
+# Run the process_session.py script
+# It will automatically:
+# - Download sessions.csv if needed
+# - Filter for functional_connectivity sessions
+# - Process sessions based on txt files in data/run1/, data/run2/, data/run3/
+python /code/process_session.py
 
 
 

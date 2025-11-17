@@ -1,55 +1,72 @@
-#%%
-# !pip install allensdk
-import xarray as xr
+#!/usr/bin/env python3
+"""
+Preprocessing script for NWB files from Allen Brain Observatory.
+
+This script processes NWB files to extract neural spike data during spontaneous
+epochs, filters units by brain region/area/layer, and prepares data for HMM analysis.
+
+Main processing steps:
+1. Extract units from NWB file
+2. Merge with unit metadata from CSV
+3. Classify waveforms and optogenetic responses
+4. Filter units by region/area/layer
+5. Extract spike counts during spontaneous epochs
+6. Extract behavioral data (running speed, pupil area)
+7. Save preprocessed data as pickle file
+"""
+
 import os
-import itertools as it
-from pathlib import Path
-import numpy as np
-import glob
-import shutil
-import pandas as pd
-import pynwb
-from pynwb import NWBHDF5IO
+import time
 import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from pynwb import NWBHDF5IO
+
+# Import shared utilities and configuration
+from utils import (
+    midbins,
+    find_permutation_seq,
+    sequence2midpoints,
+    isininterval,
+    area2region,
+    grpBySameConsecutiveItem,
+    classify_waveform,
+    optotagging_spike_counts,
+    classify_10mspulses as classify_10mspulses_util,
+    get_spikecounts_during_spontaneous_epochs_nwb,
+)
+import config
+
+# Set numpy random seed for reproducibility
+np.random.seed(config.RANDOM_SEED)
+
+# Suppress warnings for cleaner output
 warnings.simplefilter(action='ignore')
 
-# Set up paths - support both container /data and local data/
-data_dir_abs = Path('/data')
-data_dir_rel = Path(__file__).resolve().parents[1] / 'data'
-
-# Prefer relative path if it exists (for local development)
-# Otherwise use absolute path (for container environments)
-if data_dir_rel.exists() and data_dir_rel.is_dir():
-    datafolder = data_dir_rel
-elif data_dir_abs.exists() and data_dir_abs.is_dir():
-    datafolder = data_dir_abs
-else:
-    # Default to relative for local development
-    datafolder = data_dir_rel
-
-# Output folder - use /results in container, results/ locally
-results_dir_abs = Path('/results')
-results_dir_rel = Path(__file__).resolve().parents[1] / 'results'
-
-if results_dir_rel.exists() and results_dir_rel.is_dir():
-    results_dir = results_dir_rel
-elif results_dir_abs.exists() and results_dir_abs.is_dir():
-    results_dir = results_dir_abs
-else:
-    # Default to relative for local development
-    results_dir = results_dir_rel
-
-savefolder = results_dir / 'sessions_preprocessed'
-nwb_folder = datafolder / 'sessions_nwb'
-unit_table_file = datafolder / 'unit_table_all.csv'
-sessions_file = datafolder / 'sessions.csv'
+# Set up paths using config
+datafolder = config.get_data_dir()
+results_dir = config.get_results_dir()
+savefolder = config.get_preprocessed_folder()
+nwb_folder = config.get_nwb_folder()
+sessions_file = config.get_sessions_csv()
+unit_table_file = config.get_unit_table_csv()
 
 # Create output directory
 savefolder.mkdir(parents=True, exist_ok=True)
 
 # Load sessions table to filter for functional_connectivity sessions
 def load_functional_connectivity_sessions():
-    """Load session IDs that are labeled as functional_connectivity"""
+    """
+    Load session IDs that are labeled as functional_connectivity.
+    
+    Reads the sessions.csv file and filters for sessions with
+    session_type == 'functional_connectivity'.
+    
+    Returns:
+        set: Set of session ID strings, or None if sessions.csv doesn't exist
+    """
     if not sessions_file.exists():
         print(f"Warning: {sessions_file} not found, processing all NWB files")
         return None
@@ -61,250 +78,57 @@ def load_functional_connectivity_sessions():
     print(f"Found {len(fc_session_ids)} functional_connectivity sessions")
     return fc_session_ids
 
-#%%
-def get_spikecounts_during_spontaneous_epochs(nwb_file, uID_list, bSize=0.5, binarize=False, dtype=None):
-    """Get spike counts during spontaneous epochs from NWB file"""
+
+def get_spikecounts_during_spontaneous_epochs(nwb_file, uID_list, bSize=None, binarize=False, dtype=None):
+    """
+    Extract spike counts during spontaneous epochs from NWB file.
     
-    # Extract stimulus table from NWB intervals
-    if hasattr(nwb_file, 'intervals') and 'spontaneous_presentations' in nwb_file.intervals:
-        spontaneous_table = nwb_file.intervals['spontaneous_presentations']
-        start_times = spontaneous_table.start_time[:] if hasattr(spontaneous_table.start_time, '__getitem__') else spontaneous_table.start_time
-        stop_times = spontaneous_table.stop_time[:] if hasattr(spontaneous_table.stop_time, '__getitem__') else spontaneous_table.stop_time
-        durations = stop_times - start_times
-    else:
-        print("No spontaneous presentations found in NWB file")
-        return [], []
+    Wrapper function that calls the utility function from utils.
     
-    # Ensure it was for long enough (1500 seconds = 25 minutes)
-    iBlocks = np.where(durations > 1500)[0]
-    nBlocks = len(iBlocks)
-    print(f"Found {nBlocks} epochs longer than 1500 seconds")
-    
-    if nBlocks == 0:
-        print("No spontaneous epochs longer than 1500 seconds found, skipping session")
-        return [], []
-    
-    # Create mapping from unit ID to position in NWB units table
-    unit_id_to_position = {}
-    for i in range(len(nwb_file.units)):
-        unit_data = nwb_file.units[i]
-        unit_id = unit_data.index[0] if hasattr(unit_data, 'index') and len(unit_data.index) > 0 else i
-        unit_id_to_position[unit_id] = i
-    
-    spikecount_list = []
-    timecourse_list = []
-    
-    # Loop through spontaneous blocks
-    for iEpoch in iBlocks:
-        tStart = start_times[iEpoch]
-        tStop = stop_times[iEpoch]
-        duration = tStop - tStart
+    Args:
+        nwb_file: NWB file object
+        uID_list: List of unit IDs to extract
+        bSize: Bin size in seconds (uses config default if None)
+        binarize: Whether to binarize spike counts
+        dtype: Optional data type for output arrays
         
-        # Bin spikes into windows to calculate simple FR vector for each neuron
-        bin_edges = np.arange(tStart, tStop, bSize)
-        starts = bin_edges[:-1]
-        ends = bin_edges[1:]
-        tiled_data = np.zeros((bin_edges.shape[0] - 1, len(uID_list)),
-                              dtype=(np.uint8 if binarize else np.uint16) if dtype is None else dtype)
+    Returns:
+        Tuple of (spikecount_list, timecourse_list)
+    """
+    if bSize is None:
+        bSize = config.BIN_SIZE_SPONTANEOUS
+    return get_spikecounts_during_spontaneous_epochs_nwb(nwb_file, uID_list, bSize, binarize, dtype)
+
+
+def classify_10mspulses_nwb(units_details, nwb_file):
+    """
+    Classify units based on responses to 10ms optogenetic pulses.
+    
+    Wrapper function that calls the utility function from utils.
+    
+    Args:
+        units_details: DataFrame with unit details
+        nwb_file: NWB file object
         
-        # Loop through each neuron
-        for ii, unit_id in enumerate(uID_list):
-            if unit_id in unit_id_to_position:
-                # Get spike times for this unit from NWB using position
-                unit_position = unit_id_to_position[unit_id]
-                unit_data = nwb_file.units[unit_position]
-                spike_times = unit_data['spike_times'].values[0] if hasattr(unit_data['spike_times'], 'values') else unit_data['spike_times']
-                
-                # Ignore invalid spike times
-                pos = np.where(spike_times > 0)[0]
-                data = spike_times[pos]
-                
-                # Ensure spike times are sorted
-                sort_indices = np.argsort(data)
-                start_positions = np.searchsorted(data, starts.flat, sorter=sort_indices)
-                end_positions = np.searchsorted(data, ends.flat, side="right", sorter=sort_indices)
-                counts = (end_positions - start_positions)
-                
-                tiled_data[:, ii].flat = counts > 0 if binarize else counts
-            else:
-                print(f"Warning: Unit ID {unit_id} not found in NWB file")
-                tiled_data[:, ii].flat = 0
-        
-        # Save matrix to list
-        spikecount_list.append(tiled_data.T)
-        timecourse_list.append(bin_edges[:-1] + np.diff(bin_edges) / 2)
-    
-    return spikecount_list, timecourse_list
-
-def midbins(x):
-    return x[:-1] + (x[1] - x[0]) / 2
-
-def find_permutation_seq(x, y):
-    x_el = np.unique(x)
-    y_el = np.unique(y)
-    x_elpos = [np.nanmean([np.mean(np.where(row == el)[0]) for row in x]) for el in x_el]
-    y_elpos = [np.nanmean([np.mean(np.where(row == el)[0]) for row in y]) for el in y_el]
-    x_elids = np.argsort(x_elpos)
-    y_elids = np.argsort(y_elpos)
-    permutation = [np.where(x_elids == el)[0][0] for el in y_elids]
-    return permutation
-
-def hmm_fit(data, num_states, num_iters, true_states = None):
-    import ssm
-    num_trials = len(data)
-    num_neurons = data[0].shape[0]
-    # ini_state = np.zeros(num_states)
-    # ini_state[0] = 1
-    # init_dist = ssm.init_state_distns.FixedInitialStateDistribution(num_states, num_neurons, pi0=ini_state)
-    hmm = ssm.HMM(num_states, num_neurons, observations="poisson")#, init_state_distn=init_dist)
-    train_data = [data[i].transpose().astype(np.int8) for i in range(num_trials)]
-    train_lls = hmm.fit(train_data, method="em", num_iters = num_iters)
-    hmm_z = np.array([hmm.most_likely_states(train_data[i_trial]) for i_trial in range(num_trials)])
-    hmm_ll = np.array([hmm.observations.log_likelihoods(train_data[i_trial], None, None, None) for i_trial in range(num_trials)])
-    hmm_ps = np.array([hmm.filter(train_data[i_trial]) for i_trial in range(num_trials)])
-    # hmm_ps = np.exp(hmm_ll) / np.sum(np.exp(hmm_ll), axis=2)[:, :, np.newaxis]
-    return hmm_z, hmm_ll, hmm_ps
-
-def sequence2midpoints(sequence):
-    final_points = np.array(np.where(np.diff(sequence) != 0)[0])
-    initial_points = final_points+1
-    initial_points = np.insert(initial_points, 0, 0)
-    final_points = np.append(final_points, len(sequence)-1)
-    mid_points = np.round((initial_points + final_points) /2).astype('int')
-    # This fixes initial and last state to have middle point respectively at beginning and end of array
-    # mid_points[0] = 0
-    # mid_points[-1] = len(sequence) - 1
-    mid_points = np.insert(mid_points, 0, 0)
-    mid_points = np.append(mid_points, len(sequence)-1)
-    mid_values = sequence[mid_points]
-    return mid_points, mid_values
-
-def isininterval(x, a, b, y=None, axis = 0):
-    if len(x.shape) > 0:
-        x = np.swapaxes(x, 0, axis)
-    if np.array(y == None).any():
-        x = x[(x >= a) & (x <= b)]
-    else:
-        x = x[(y >= a) & (y <= b)]
-    if len(x.shape) > 0:
-        x = np.swapaxes(x, 0, axis)
-    return x
-
-def area2region(units, field):
-    dict = {'Thalamus': ['LGd', 'LGn', 'LP', 'LD', 'POL', 'MD', 'VPL', 'PO', 'VPM', 'RT', 'MG', 'MGv', 'MGd', 'Eth', 'SGN', 'TH'],
-           'others': ['RSP', 'OLF', 'BLA', 'ZI', 'grey'],
-            'Hippocampus': ['DG', 'CA3', 'CA1', 'SUB', 'POST', 'ProS'],
-            'FrontalCortex': ['ACA', 'MOs', 'PL', 'ILA', 'ORB', 'MOp', 'SSp'],
-            'VisualCortex' : ['VISp', 'VISl', 'VISpm', 'VISam', 'VISrl', 'VISa', 'VISal', 'VIS', 'VISli', 'VISlm'],
-            'Midbrain' : ['SCs', 'SCm', 'MRN', 'APN', 'PAG', 'MB'],
-            'BasalGanglia' : ['CP', 'GPe', 'SNr', 'ACB', 'LS']}
-
-    df = pd.DataFrame.from_dict(dict.items())
-    df = df.explode(1)
-    df = df.rename(columns= {0:'region', 1:'area'})
-    df = df.merge(units, left_on = 'area', right_on = field)
-    return df
-
-def grpBySameConsecutiveItem(l, max_length = 15, min_length = 3, value=True):
-    rv= []
-    rv_idx = []
-    last = None
-    last_idx = None
-    for i_elem, elem in enumerate(l):
-        if last == None:
-            last = [elem]
-            last_idx = [i_elem]
-            continue
-        if (elem == last[0]) & (len(last) < max_length):
-            last.append(elem)
-            last_idx.append(i_elem)
-            continue
-        if (len(last) >= min_length) & (last[0]==value):
-            rv.append(last)
-            rv_idx.append(last_idx)
-        last = [elem]
-        last_idx = [i_elem]
-    return rv, rv_idx
-
-def classify_waveform(units_details):
-    from sklearn.mixture import GaussianMixture
-    X = units_details['waveform_duration'].values
-    X = X.reshape(-1,1)
-    gm = GaussianMixture(n_components=3, random_state=0, covariance_type='full').fit(X)
-    clu = gm.predict(X)
-    clu_p = np.max(gm.predict_proba(X), axis=1)
-
-    ini_idx = (clu == np.argmin(gm.means_)) & (clu_p > 0.95)
-    exc_idx = (clu == np.argsort(gm.means_)[1][0]) & (clu_p > 0.95)
-    oth_idx = (clu == np.argmax(gm.means_)) & (clu_p > 0.95)
-    units_details['EI_type'] = np.nan
-    units_details['EI_type'][exc_idx] = 'Exc'
-    units_details['EI_type'][ini_idx] = 'Ini'
-    units_details['EI_type'][oth_idx] = 'Oth'
-    return units_details
-
-def optotagging_spike_counts(bin_edges, trials, session, units):
-    time_resolution = np.mean(np.diff(bin_edges))
-    spike_matrix = np.zeros((len(trials), len(bin_edges)-1, len(units)))
-    for unit_idx, unit_id in enumerate(units.index.values):
-        spike_times = session.spike_times[unit_id]
-        for trial_idx, trial_start in enumerate(trials.start_time.values):
-            in_range = (spike_times > (trial_start + bin_edges[0])) * \
-                       (spike_times < (trial_start + bin_edges[-1]))
-            binned_times = ((spike_times[in_range] - (trial_start + bin_edges[0])) / time_resolution).astype('int')
-            binned_times, counts = np.unique(binned_times, return_counts=True)
-            spike_matrix[trial_idx, binned_times, unit_idx] = counts
-    return xr.DataArray(
-        name='spike_counts',
-        data=spike_matrix,
-        coords={'trial_id': trials.index.values, 'time_relative_to_stimulus_onset': (bin_edges[:-1]+bin_edges[1:])/2, 'unit_id': units.index.values},
-        dims=['trial_id', 'time_relative_to_stimulus_onset', 'unit_id'])
-
-def classify_10mspulses(units_details, nwb_file):
-    # Extract optogenetic stimulation epochs from NWB file
-    units_details['opto_10ms'] = np.nan
-    
-    try:
-        # Get optogenetic stimulation epochs
-        if hasattr(nwb_file, 'processing') and 'optotagging' in nwb_file.processing:
-            opto_module = nwb_file.processing['optotagging']
-            if 'optogenetic_stimulation' in opto_module.data_interfaces:
-                stim_epochs = opto_module.data_interfaces['optogenetic_stimulation'].to_dataframe()
-                
-                # Filter for 10ms pulses (9-20ms duration)
-                ten_ms_pulses = stim_epochs[(stim_epochs['duration'] > 0.009) & (stim_epochs['duration'] < 0.02)]
-                
-                if len(ten_ms_pulses) > 0:
-                    print(f'Found {len(ten_ms_pulses)} optogenetic 10ms pulses')
-                    
-                    # Get genotype from subject information
-                    genotype = 'wt/wt'  # Default
-                    if hasattr(nwb_file, 'subject'):
-                        subject = nwb_file.subject
-                        if hasattr(subject, 'genotype'):
-                            genotype = subject.genotype
-                    
-                    # Extract first 3 characters of genotype
-                    genotype_short = genotype[:3] if len(genotype) >= 3 else genotype
-                    
-                    # For now, we'll need to implement the spike analysis
-                    # This is a simplified version that would need the full optotagging_spike_counts implementation
-                    print(f'Genotype: {genotype} -> {genotype_short}')
-                    print('Note: Full optogenetic analysis requires implementing spike count analysis around stimulation times')
-                    print('This would involve extracting spike times and analyzing responses to optogenetic stimulation')
-                else:
-                    print('No 10ms optogenetic pulses found')
-            else:
-                print('No optogenetic stimulation data found in NWB file')
-        else:
-            print('No optotagging module found in NWB file')
-    except Exception as e:
-        print(f'Error in optogenetic analysis: {e}')
-    
-    return units_details
+    Returns:
+        DataFrame with added 'opto_10ms' column
+    """
+    return classify_10mspulses_util(units_details, nwb_file, use_nwb=True)
 
 def create_units_dataframe(nwb_file, session_id):
-    """Create units dataframe from NWB file similar to Allen SDK format"""
+    """
+    Create units DataFrame from NWB file, extracting unit information.
+    
+    Extracts spike times, waveform properties, quality metrics, and other
+    unit metadata from the NWB file.
+    
+    Args:
+        nwb_file: NWB file object
+        session_id: Session ID string
+        
+    Returns:
+        DataFrame with unit information
+    """
     units = nwb_file.units
     unit_data = []
     
@@ -381,9 +205,44 @@ def create_units_dataframe(nwb_file, session_id):
     df_units = pd.DataFrame(unit_data)
     return df_units
 
-def preprocess_data(nwb_file, session_id, region=None, area=None, layer=0., N_min_neurons=1, bin_size=0.005):
-    """Preprocess data from NWB file similar to original preprocessing"""
-    import time
+def preprocess_data(nwb_file, session_id, region=None, area=None, layer=None, N_min_neurons=None, bin_size=None):
+    """
+    Main preprocessing function: extract and prepare neural data from NWB file.
+    
+    Processing pipeline:
+    1. Extract units from NWB file
+    2. Load and merge unit metadata from CSV
+    3. Classify waveforms and optogenetic responses
+    4. Assign region/area information
+    5. Filter units by region/area/layer
+    6. Extract spike counts during spontaneous epochs
+    7. Extract behavioral data (running speed, pupil area)
+    8. Prepare output DataFrame
+    
+    Args:
+        nwb_file: NWB file object
+        session_id: Session ID string
+        region: Brain region to filter (e.g., 'VisualCortex')
+        area: Brain area to filter (e.g., 'VISp')
+        layer: Cortical layer to filter (0 = all layers)
+        N_min_neurons: Minimum number of neurons required
+        bin_size: Bin size in seconds for spike counts
+        
+    Returns:
+        DataFrame with preprocessed data, or None if processing fails
+    """
+    # Use config defaults if not specified
+    if region is None:
+        region = config.DEFAULT_REGION
+    if area is None:
+        area = config.DEFAULT_AREA
+    if layer is None:
+        layer = config.DEFAULT_LAYER
+    if N_min_neurons is None:
+        N_min_neurons = config.N_MIN_NEURONS_PREPROCESS
+    if bin_size is None:
+        bin_size = config.BIN_SIZE
+    
     preprocess_start = time.time()
     
     print(f"\n[PREPROCESS {session_id}] Starting preprocessing pipeline")
@@ -425,7 +284,7 @@ def preprocess_data(nwb_file, session_id, region=None, area=None, layer=0., N_mi
         
         # Classify optogenetic responses (for NWB files, this will set all to NaN)
         print(f"[PREPROCESS {session_id}]   Classifying optogenetic responses...")
-        units_details = classify_10mspulses(units_details, nwb_file)
+        units_details = classify_10mspulses_nwb(units_details, nwb_file)
         
         # Merge on unit_id
         print(f"[PREPROCESS {session_id}]   Merging unit data...")
@@ -619,7 +478,7 @@ def preprocess_data(nwb_file, session_id, region=None, area=None, layer=0., N_mi
     
     return df
 
-#%%
+# Main execution block
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
@@ -630,13 +489,13 @@ if __name__ == '__main__':
     session_arg = args.session
     process_all_sessions = args.all_sessions
 
-#%%
-    bin_size = 0.005
-    region = 'VisualCortex'
-    area = None  # 'VISp'
-    layers = [0]  # np.arange(7)
-    regions_of_interest = ['Thalamus', 'others', 'Hippocampus', 'FrontalCortex', 'VisualCortex', 'Midbrain', 'BasalGanglia']
-    areas_of_interest = ['VISp', 'VISrl', 'VISl', 'VISal', 'VISpm', 'VISam', 'LGn', 'LGd', 'CA1', 'CA3', 'DG']
+    # Preprocessing parameters (use config defaults)
+    bin_size = config.BIN_SIZE
+    region = config.DEFAULT_REGION
+    area = config.DEFAULT_AREA
+    layers = [config.DEFAULT_LAYER]
+    regions_of_interest = config.REGIONS_OF_INTEREST
+    areas_of_interest = config.AREAS_OF_INTEREST
     
     # Load functional connectivity sessions
     fc_session_ids = load_functional_connectivity_sessions()
@@ -714,7 +573,6 @@ if __name__ == '__main__':
     
     # Load NWB file
     print(f"\n[PREPROCESS {session_id}] Loading NWB file: {nwb_file_path}")
-    import time
     load_start = time.time()
     try:
         io = NWBHDF5IO(str(nwb_file_path), mode='r')
@@ -733,7 +591,7 @@ if __name__ == '__main__':
     if df is not None:
         print(f"\n[PREPROCESS {session_id}] Saving preprocessed data...")
         save_start = time.time()
-        output_file = savefolder / f'df_{session_id}.pkl'
+        output_file = savefolder / config.PREPROCESSED_FILE_PATTERN.format(session_id=session_id)
         df.to_pickle(output_file)
         save_time = time.time() - save_start
         output_size_mb = output_file.stat().st_size / (1024 * 1024)
@@ -749,5 +607,3 @@ if __name__ == '__main__':
     # Clean up
     io.close()
     print(f"[PREPROCESS {session_id}] [OK] NWB file closed")
-
-# %%
